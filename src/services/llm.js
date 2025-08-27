@@ -1,18 +1,5 @@
-// Cliente LLM (OpenAI-compat) com function-calling forçada para JSON estável.
 import { loadConfig } from "../config.js";
-import { ZodSchema, z } from "zod";
-
-const ExtractSchema = z.object({
-  features: z.array(z.string()).default([]),
-  modifiers: z.record(z.any()).default({}),
-  demographics: z
-    .object({
-      idade: z.number().int().min(0).max(120).nullable().optional(),
-      sexo: z.enum(["M", "F"]).nullable().optional(),
-      comorbidades: z.array(z.string()).default([])
-    })
-    .default({}),
-});
+import { ExtractSchema } from "../schemas/extract.schema.js";
 
 export async function llmExtract({ text, featuresUniverse }) {
   const cfg = loadConfig();
@@ -95,7 +82,6 @@ export async function llmExtract({ text, featuresUniverse }) {
     const out = ExtractSchema.safeParse(parsed);
     if (!out.success) return null;
 
-    // Filtra por universo permitido
     const allowed = new Set(featuresUniverse);
     const features = (out.data.features || []).filter((f) => allowed.has(f));
     return {

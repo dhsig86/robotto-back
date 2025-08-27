@@ -4,6 +4,8 @@ import cors from "cors";
 import { loadConfig } from "./src/config.js";
 import { getRegistry } from "./src/registryLoader.js";
 import triageRouter from "./src/routes/triage.js";
+import debugRouter from "./src/routes/debug.js";
+import { metrics } from "./src/metrics.js";
 
 const cfg = loadConfig();
 const app = express();
@@ -19,22 +21,29 @@ app.use(
 app.use(express.json({ limit: "1mb" }));
 
 // Healthcheck
-app.get("/", (_req, res) => {
+app.get("/", async (_req, res) => {
+  const reg = await getRegistry();
   res.json({
     ok: true,
     name: "robotto-backend",
-    registryLoaded: !!getRegistry()?.featuresSet?.size
+    registryLoaded: !!reg?.featuresSet?.size,
+    metrics
   });
 });
 
 // API
 app.use("/api/triage", triageRouter);
+app.use("/api/registry", debugRouter);
+
+// Métricas simples
+app.get("/api/metrics", (_req, res) => {
+  res.json(metrics);
+});
 
 // Boot
 const port = Number(process.env.PORT || 3000);
 app.listen(port, () => {
-  // eslint-disable-next-line no-console
   console.log(`[ROBOTTO] backend up on :${port} (env=${process.env.NODE_ENV || "production"})`);
-  // warm registry load (async)
+  // warm registry
   getRegistry(true).catch(() => {});
 });
