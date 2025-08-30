@@ -1,4 +1,4 @@
-// ROBOTTO backend — registry loader com coercion, fallbacks e reindexação de segurança
+// ROBOTTO backend — registry loader com coercion de formatos e fallback forçado
 import { loadConfig } from "./config.js";
 import { normalizeStr } from "./utils/text.js";
 
@@ -10,9 +10,18 @@ export async function getRegistry(warm = false) {
   if (_cache && fresh && !warm) return _cache;
 
   const cfg = loadConfig();
-  const out = { raw: {}, featuresSet: new Set(), idToMeta: {}, aliasToId: new Map() };
 
-  // 1) tenta snapshot (REGISTRY_URL)
+  const out = {
+    raw: {},
+    featuresSet: new Set(),
+    idToMeta: {},
+    aliasToId: new Map(),
+    featuresMap: {},
+    redflags: {},
+    byGlobalId: {},
+  };
+
+  // ── 1) tenta snapshot (REGISTRY_URL)
   let snap = null;
   if (cfg.REGISTRY_URL) {
     try {
@@ -26,13 +35,13 @@ export async function getRegistry(warm = false) {
     }
   }
 
-  // 2) extrai possíveis formatos do snapshot (pode vir em várias formas)
+  // ── 2) extrai possíveis caminhos do snapshot
   let { featuresMap, redflagsMap, byGlobalId } = extractFromSnapshot(snap);
 
-  // 3) coagir featuresMap para mapa id->meta (funciona para {version, features:[]}, lista pura, ou mapa)
+  // coage para mapa id→meta (funciona p/ {version, features:[...]}, lista pura, ou mapa)
   featuresMap = coerceFeaturesMap(featuresMap);
 
-  // 4) fallbacks diretos se vazio
+  // ── 3) fallbacks diretos se vazio
   if (!featuresMap || !Object.keys(featuresMap).length) {
     if (cfg.FEATURES_URL) {
       try {
@@ -61,10 +70,10 @@ export async function getRegistry(warm = false) {
     }
   }
 
-  // 5) indexar (1ª passada)
+  // ── 4) indexa (1ª passada)
   indexAll(out, featuresMap, redflagsMap, byGlobalId);
 
-  // 6) guard-rail: se ainda ficou 0 (snapshot estranho), força fallback e reindexa
+  // ── 5) guard-rail: se ainda ficou 0, força fallback e reindexa
   if (out.featuresSet.size === 0 && cfg.FEATURES_URL) {
     try {
       const r = await fetch(cacheBust(cfg.FEATURES_URL), { cache: "no-store" });
@@ -72,8 +81,6 @@ export async function getRegistry(warm = false) {
         const json = await r.json();
         featuresMap = coerceFeaturesMap(json);
         out.raw.features_forced_fallback = true;
-
-        // reindexa
         indexAll(out, featuresMap, redflagsMap, byGlobalId);
       }
     } catch (e) {
@@ -107,15 +114,15 @@ export function allowedFeaturesFrom(bodyMap, reg) {
 function extractFromSnapshot(snap) {
   if (!snap || typeof snap !== "object") return { featuresMap: {}, redflagsMap: {}, byGlobalId: {} };
 
-  // Tenta múltiplos caminhos conhecidos
+  // tenta vários caminhos comuns; alguns são listas
   const featuresMap =
     snap.featuresMap ||
-    snap.features ||                            // pode ser lista
+    snap.features ||
     snap.byFeatureId ||
     snap.registry?.featuresMap ||
-    snap.registry?.features ||                  // lista
+    snap.registry?.features ||
     snap.global?.featuresMap ||
-    snap.global?.features ||                    // lista
+    snap.global?.features ||
     {};
 
   let redflagsMap =
@@ -139,12 +146,13 @@ function extractFromSnapshot(snap) {
  *  - { version, features: [ {id,label,aliases}... ] }
  *  - [ {id,label,aliases}... ]
  *  - { id: {label,aliases}, ... }
+ *  Devolve sempre { id: {label, aliases?: string[] } }
  */
 function coerceFeaturesMap(input) {
   if (!input) return {};
-  // caso: { version, features: [...] }
+  // wrapper { version, features: [...] }
   if (!Array.isArray(input) && Array.isArray(input.features)) return coerceFeaturesMap(input.features);
-  // caso: lista pura
+  // lista pura
   if (Array.isArray(input)) {
     const map = {};
     for (const it of input) {
@@ -156,15 +164,14 @@ function coerceFeaturesMap(input) {
     }
     return map;
   }
-  // caso: já é mapa (ou objeto qualquer) — se não tiver nenhuma key típica, devolve {} para forçar fallback
+  // já é objeto: se não “parece mapa” (sem chaves tipo featureId), devolve {}
   const keys = Object.keys(input);
-  const looksLikeMap = keys.some((k) => /^[a-z0-9_.]+$/.test(k)); // feature ids
+  const looksLikeMap = keys.some((k) => /^[a-z0-9_.]+$/.test(k));
   if (!looksLikeMap) return {};
   return input;
 }
 
 function splitAliases(s) {
-  // separa por vírgula, ponto-e-vírgula, pipe — e se não houver, usa a string inteira
   const base = String(s || "").trim();
   const parts = base.split(/[;,|]/g).map((x) => x.trim()).filter(Boolean);
   const set = new Set(parts.length ? parts : [base]);
@@ -212,14 +219,12 @@ function indexAll(out, featuresMap, redflagsMap, byGlobalId) {
 
     const rawAliases = new Set();
 
-    // aliases do arquivo
+    // aliases
     if (Array.isArray(meta.aliases)) {
       meta.aliases.forEach((x) => x && rawAliases.add(String(x)));
-    } else if (typeof meta.aliases === "string" && meta.aliases.trim()) {
-      splitAliases(meta.aliases).forEach((x) => rawAliases.add(x));
     }
 
-    // label expandido
+    // label expandido ↔ “dor de garganta (odinofagia)” gera “dor de garganta”, “odinofagia”
     if (meta.label) {
       rawAliases.add(meta.label);
       explodeLabel(meta.label).forEach((x) => rawAliases.add(x));
