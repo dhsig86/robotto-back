@@ -1,3 +1,4 @@
+// ROBOTTO backend — fallback de extração NL (substring + bag-of-words)
 import { normalizeStr, stripDiacritics } from "../utils/text.js";
 
 const STOP = new Set(["de","da","do","das","dos","e","a","o","as","os","para","no","na","nos","nas","com","em","por","um","uma"]);

@@ -1,17 +1,10 @@
-// ROBOTTO backend — registry loader com fallbacks e logging
+// ROBOTTO backend — registry loader com coercion, fallbacks e reindexação de segurança
 import { loadConfig } from "./config.js";
 import { normalizeStr } from "./utils/text.js";
 
 let _cache = null;
 let _ts = 0;
 
-/**
- * Carrega o registry (snapshot + fallbacks) e indexa:
- *  - featuresSet: Set<string> de featureIds
- *  - idToMeta: { [featureId]: meta }
- *  - aliasToId: Map<aliasNormalizado, featureId>
- *  - featuresMap/redflags/byGlobalId para consumidores que precisem
- */
 export async function getRegistry(warm = false) {
   const fresh = Date.now() - _ts < 10 * 60 * 1000;
   if (_cache && fresh && !warm) return _cache;
@@ -23,7 +16,7 @@ export async function getRegistry(warm = false) {
   let snap = null;
   if (cfg.REGISTRY_URL) {
     try {
-      const res = await fetch(withBust(cfg.REGISTRY_URL), { cache: "no-store" });
+      const res = await fetch(cacheBust(cfg.REGISTRY_URL), { cache: "no-store" });
       if (!res.ok) throw new Error(`registry fetch ${res.status}`);
       snap = await res.json();
       out.raw.snapshot_ok = true;
@@ -33,16 +26,20 @@ export async function getRegistry(warm = false) {
     }
   }
 
-  // 2) extrai possíveis formatos do snapshot
+  // 2) extrai possíveis formatos do snapshot (pode vir em várias formas)
   let { featuresMap, redflagsMap, byGlobalId } = extractFromSnapshot(snap);
 
-  // 3) fallbacks diretos se vazio
+  // 3) coagir featuresMap para mapa id->meta (funciona para {version, features:[]}, lista pura, ou mapa)
+  featuresMap = coerceFeaturesMap(featuresMap);
+
+  // 4) fallbacks diretos se vazio
   if (!featuresMap || !Object.keys(featuresMap).length) {
     if (cfg.FEATURES_URL) {
       try {
-        const r = await fetch(withBust(cfg.FEATURES_URL), { cache: "no-store" });
+        const r = await fetch(cacheBust(cfg.FEATURES_URL), { cache: "no-store" });
         if (r.ok) {
-          featuresMap = await r.json();
+          const json = await r.json();
+          featuresMap = coerceFeaturesMap(json);
           out.raw.features_fallback = true;
         }
       } catch (e) {
@@ -53,7 +50,7 @@ export async function getRegistry(warm = false) {
   if (!redflagsMap || !Object.keys(redflagsMap).length) {
     if (cfg.REDFLAGS_URL) {
       try {
-        const r = await fetch(withBust(cfg.REDFLAGS_URL), { cache: "no-store" });
+        const r = await fetch(cacheBust(cfg.REDFLAGS_URL), { cache: "no-store" });
         if (r.ok) {
           redflagsMap = await r.json();
           out.raw.redflags_fallback = true;
@@ -64,55 +61,37 @@ export async function getRegistry(warm = false) {
     }
   }
 
-  // 4) indexação
-  const featuresSet = new Set();
-  const idToMeta = {};
-  const aliasToId = new Map();
+  // 5) indexar (1ª passada)
+  indexAll(out, featuresMap, redflagsMap, byGlobalId);
 
-  for (const [fid, metaRaw] of Object.entries(featuresMap || {})) {
-    const meta = metaRaw || {};
-    featuresSet.add(fid);
-    idToMeta[fid] = meta;
+  // 6) guard-rail: se ainda ficou 0 (snapshot estranho), força fallback e reindexa
+  if (out.featuresSet.size === 0 && cfg.FEATURES_URL) {
+    try {
+      const r = await fetch(cacheBust(cfg.FEATURES_URL), { cache: "no-store" });
+      if (r.ok) {
+        const json = await r.json();
+        featuresMap = coerceFeaturesMap(json);
+        out.raw.features_forced_fallback = true;
 
-    const rawAliases = new Set();
-
-    if (Array.isArray(meta.aliases)) meta.aliases.forEach((x) => rawAliases.add(x));
-    if (meta.label) {
-      rawAliases.add(meta.label);
-      explodeLabel(meta.label).forEach((x) => rawAliases.add(x));
-    }
-    rawAliases.add(fid);
-    rawAliases.add(fid.replaceAll("_", " "));
-    rawAliases.add(fid.replaceAll(".", " "));
-
-    for (const raw of rawAliases) {
-      const key = normalizeStr(raw);
-      if (key) aliasToId.set(key, fid);
+        // reindexa
+        indexAll(out, featuresMap, redflagsMap, byGlobalId);
+      }
+    } catch (e) {
+      console.error("[registryLoader] forced FEATURES_URL error:", e.message);
     }
   }
-
-  out.featuresSet = featuresSet;
-  out.idToMeta = idToMeta;
-  out.aliasToId = aliasToId;
-
-  // objetos auxiliares para quem usa
-  out.featuresMap = featuresMap || {};
-  out.redflags = normalizeRedflags(redflagsMap || {});
-  out.byGlobalId = byGlobalId || {};
 
   _cache = out;
   _ts = Date.now();
 
-  // log útil no Heroku para confirmar carregamento
   console.log(
     "[registryLoader] loaded",
     "features:", out.featuresSet.size,
     "aliases:", out.aliasToId.size,
     "snapshot_ok:", !!out.raw.snapshot_ok,
-    "fallbackF:", !!out.raw.features_fallback,
+    "fallbackF:", !!out.raw.features_fallback || !!out.raw.features_forced_fallback,
     "fallbackR:", !!out.raw.redflags_fallback
   );
-
   return _cache;
 }
 
@@ -123,18 +102,20 @@ export function allowedFeaturesFrom(bodyMap, reg) {
   return reg?.featuresSet || new Set();
 }
 
-/* ===== helpers ===== */
+/* ================= helpers ================= */
 
 function extractFromSnapshot(snap) {
   if (!snap || typeof snap !== "object") return { featuresMap: {}, redflagsMap: {}, byGlobalId: {} };
 
+  // Tenta múltiplos caminhos conhecidos
   const featuresMap =
     snap.featuresMap ||
-    snap.features ||
+    snap.features ||                            // pode ser lista
     snap.byFeatureId ||
     snap.registry?.featuresMap ||
-    snap.registry?.features ||
+    snap.registry?.features ||                  // lista
     snap.global?.featuresMap ||
+    snap.global?.features ||                    // lista
     {};
 
   let redflagsMap =
@@ -152,6 +133,42 @@ function extractFromSnapshot(snap) {
     {};
 
   return { featuresMap, redflagsMap, byGlobalId };
+}
+
+/** Aceita:
+ *  - { version, features: [ {id,label,aliases}... ] }
+ *  - [ {id,label,aliases}... ]
+ *  - { id: {label,aliases}, ... }
+ */
+function coerceFeaturesMap(input) {
+  if (!input) return {};
+  // caso: { version, features: [...] }
+  if (!Array.isArray(input) && Array.isArray(input.features)) return coerceFeaturesMap(input.features);
+  // caso: lista pura
+  if (Array.isArray(input)) {
+    const map = {};
+    for (const it of input) {
+      if (!it || !it.id) continue;
+      const meta = { label: it.label || it.id };
+      if (Array.isArray(it.aliases)) meta.aliases = it.aliases;
+      else if (typeof it.aliases === "string") meta.aliases = splitAliases(it.aliases);
+      map[it.id] = meta;
+    }
+    return map;
+  }
+  // caso: já é mapa (ou objeto qualquer) — se não tiver nenhuma key típica, devolve {} para forçar fallback
+  const keys = Object.keys(input);
+  const looksLikeMap = keys.some((k) => /^[a-z0-9_.]+$/.test(k)); // feature ids
+  if (!looksLikeMap) return {};
+  return input;
+}
+
+function splitAliases(s) {
+  // separa por vírgula, ponto-e-vírgula, pipe — e se não houver, usa a string inteira
+  const base = String(s || "").trim();
+  const parts = base.split(/[;,|]/g).map((x) => x.trim()).filter(Boolean);
+  const set = new Set(parts.length ? parts : [base]);
+  return Array.from(set);
 }
 
 function normalizeRedflags(rf) {
@@ -183,7 +200,51 @@ function explodeLabel(label) {
   return Array.from(out).filter(Boolean);
 }
 
-function withBust(url) {
+function indexAll(out, featuresMap, redflagsMap, byGlobalId) {
+  const featuresSet = new Set();
+  const idToMeta = {};
+  const aliasToId = new Map();
+
+  for (const [fid, metaRaw] of Object.entries(featuresMap || {})) {
+    const meta = metaRaw || {};
+    featuresSet.add(fid);
+    idToMeta[fid] = meta;
+
+    const rawAliases = new Set();
+
+    // aliases do arquivo
+    if (Array.isArray(meta.aliases)) {
+      meta.aliases.forEach((x) => x && rawAliases.add(String(x)));
+    } else if (typeof meta.aliases === "string" && meta.aliases.trim()) {
+      splitAliases(meta.aliases).forEach((x) => rawAliases.add(x));
+    }
+
+    // label expandido
+    if (meta.label) {
+      rawAliases.add(meta.label);
+      explodeLabel(meta.label).forEach((x) => rawAliases.add(x));
+    }
+
+    // variantes do id
+    rawAliases.add(fid);
+    rawAliases.add(fid.replaceAll("_", " "));
+    rawAliases.add(fid.replaceAll(".", " "));
+
+    for (const raw of rawAliases) {
+      const key = normalizeStr(raw);
+      if (key) aliasToId.set(key, fid);
+    }
+  }
+
+  out.featuresSet = featuresSet;
+  out.idToMeta = idToMeta;
+  out.aliasToId = aliasToId;
+  out.featuresMap = featuresMap || {};
+  out.redflags = normalizeRedflags(redflagsMap || {});
+  out.byGlobalId = byGlobalId || {};
+}
+
+function cacheBust(url) {
   const u = new URL(url);
   u.searchParams.set("_", String(Date.now()));
   return u.toString();
