@@ -1,4 +1,4 @@
-// File: backend/src/registryLoader.js
+// ROBOTTO backend — registry loader com fallbacks e logging
 import { loadConfig } from "./config.js";
 import { normalizeStr } from "./utils/text.js";
 
@@ -10,38 +10,40 @@ let _ts = 0;
  *  - featuresSet: Set<string> de featureIds
  *  - idToMeta: { [featureId]: meta }
  *  - aliasToId: Map<aliasNormalizado, featureId>
+ *  - featuresMap/redflags/byGlobalId para consumidores que precisem
  */
 export async function getRegistry(warm = false) {
   const fresh = Date.now() - _ts < 10 * 60 * 1000;
   if (_cache && fresh && !warm) return _cache;
 
   const cfg = loadConfig();
-  const result = { raw: {}, featuresSet: new Set(), idToMeta: {}, aliasToId: new Map() };
+  const out = { raw: {}, featuresSet: new Set(), idToMeta: {}, aliasToId: new Map() };
 
   // 1) tenta snapshot (REGISTRY_URL)
   let snap = null;
   if (cfg.REGISTRY_URL) {
     try {
-      const res = await fetch(cacheBust(cfg.REGISTRY_URL), { cache: "no-store" });
+      const res = await fetch(withBust(cfg.REGISTRY_URL), { cache: "no-store" });
       if (!res.ok) throw new Error(`registry fetch ${res.status}`);
       snap = await res.json();
-      result.raw.snapshot = snap;
+      out.raw.snapshot_ok = true;
     } catch (e) {
       console.error("[registryLoader] REGISTRY_URL error:", e.message);
+      out.raw.snapshot_ok = false;
     }
   }
 
-  // 2) extrai features/redflags do snapshot em formatos conhecidos
-  let { featuresMap, redflagsMap } = extractFromSnapshot(snap);
+  // 2) extrai possíveis formatos do snapshot
+  let { featuresMap, redflagsMap, byGlobalId } = extractFromSnapshot(snap);
 
   // 3) fallbacks diretos se vazio
   if (!featuresMap || !Object.keys(featuresMap).length) {
     if (cfg.FEATURES_URL) {
       try {
-        const resF = await fetch(cacheBust(cfg.FEATURES_URL), { cache: "no-store" });
-        if (resF.ok) {
-          featuresMap = await resF.json();
-          result.raw.features_fallback = true;
+        const r = await fetch(withBust(cfg.FEATURES_URL), { cache: "no-store" });
+        if (r.ok) {
+          featuresMap = await r.json();
+          out.raw.features_fallback = true;
         }
       } catch (e) {
         console.error("[registryLoader] FEATURES_URL error:", e.message);
@@ -51,10 +53,10 @@ export async function getRegistry(warm = false) {
   if (!redflagsMap || !Object.keys(redflagsMap).length) {
     if (cfg.REDFLAGS_URL) {
       try {
-        const resR = await fetch(cacheBust(cfg.REDFLAGS_URL), { cache: "no-store" });
-        if (resR.ok) {
-          redflagsMap = await resR.json();
-          result.raw.redflags_fallback = true;
+        const r = await fetch(withBust(cfg.REDFLAGS_URL), { cache: "no-store" });
+        if (r.ok) {
+          redflagsMap = await r.json();
+          out.raw.redflags_fallback = true;
         }
       } catch (e) {
         console.error("[registryLoader] REDFLAGS_URL error:", e.message);
@@ -89,18 +91,28 @@ export async function getRegistry(warm = false) {
     }
   }
 
-  result.featuresSet = featuresSet;
-  result.idToMeta = idToMeta;
-  result.aliasToId = aliasToId;
+  out.featuresSet = featuresSet;
+  out.idToMeta = idToMeta;
+  out.aliasToId = aliasToId;
 
-  // 5) anexos úteis (se existirem) para quem usa
-  result.featuresMap = featuresMap || {};
-  result.redflags = redflagsMap || {};
-  result.byGlobalId = snap?.byGlobalId || snap?.globalById || snap?.registry?.byGlobalId || {};
-  result.redflagsByFeatureId = redflagsMap || {};
+  // objetos auxiliares para quem usa
+  out.featuresMap = featuresMap || {};
+  out.redflags = normalizeRedflags(redflagsMap || {});
+  out.byGlobalId = byGlobalId || {};
 
-  _cache = result;
+  _cache = out;
   _ts = Date.now();
+
+  // log útil no Heroku para confirmar carregamento
+  console.log(
+    "[registryLoader] loaded",
+    "features:", out.featuresSet.size,
+    "aliases:", out.aliasToId.size,
+    "snapshot_ok:", !!out.raw.snapshot_ok,
+    "fallbackF:", !!out.raw.features_fallback,
+    "fallbackR:", !!out.raw.redflags_fallback
+  );
+
   return _cache;
 }
 
@@ -111,16 +123,12 @@ export function allowedFeaturesFrom(bodyMap, reg) {
   return reg?.featuresSet || new Set();
 }
 
-function emptyRegistry() {
-  return { raw: {}, featuresSet: new Set(), idToMeta: {}, aliasToId: new Map() };
-}
+/* ===== helpers ===== */
 
-/** Tenta ler diferentes formatos conhecidos de snapshot. */
 function extractFromSnapshot(snap) {
-  if (!snap || typeof snap !== "object") return { featuresMap: {}, redflagsMap: {} };
+  if (!snap || typeof snap !== "object") return { featuresMap: {}, redflagsMap: {}, byGlobalId: {} };
 
-  // possibilidades para features
-  const fm =
+  const featuresMap =
     snap.featuresMap ||
     snap.features ||
     snap.byFeatureId ||
@@ -129,9 +137,7 @@ function extractFromSnapshot(snap) {
     snap.global?.featuresMap ||
     {};
 
-  // possibilidades para redflags
-  // pode vir como array, map booleano, ou objeto detalhado
-  let rf =
+  let redflagsMap =
     snap.redflagsByFeatureId ||
     snap.redflags_map ||
     snap.redflags ||
@@ -139,17 +145,24 @@ function extractFromSnapshot(snap) {
     snap.global?.redflags ||
     {};
 
-  // normalizar redflags para map { featureId: true }
-  if (Array.isArray(rf)) {
-    const tmp = {};
-    for (const k of rf) tmp[k] = true;
-    rf = tmp;
-  }
+  const byGlobalId =
+    snap.byGlobalId ||
+    snap.globalById ||
+    snap.registry?.byGlobalId ||
+    {};
 
-  return { featuresMap: fm, redflagsMap: rf };
+  return { featuresMap, redflagsMap, byGlobalId };
 }
 
-/** Quebra labels em partes úteis: fora/dentro de parênteses + separadores comuns. */
+function normalizeRedflags(rf) {
+  if (Array.isArray(rf)) {
+    const m = {};
+    for (const k of rf) m[k] = true;
+    return m;
+  }
+  return rf || {};
+}
+
 function explodeLabel(label) {
   const out = new Set();
   const base = String(label || "");
@@ -170,7 +183,7 @@ function explodeLabel(label) {
   return Array.from(out).filter(Boolean);
 }
 
-function cacheBust(url) {
+function withBust(url) {
   const u = new URL(url);
   u.searchParams.set("_", String(Date.now()));
   return u.toString();
